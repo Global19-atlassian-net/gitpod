@@ -42,7 +42,7 @@ func (m *Mux) Get(alias string) (*Term, bool) {
 
 // Start starts a new command in its own pseudo-terminal and returns an alias
 // for that pseudo terminal.
-func (m *Mux) Start(cmd *exec.Cmd) (alias string, err error) {
+func (m *Mux) Start(cmd *exec.Cmd, options TermOptions) (alias string, err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -57,7 +57,7 @@ func (m *Mux) Start(cmd *exec.Cmd) (alias string, err error) {
 	}
 	alias = uid.String()
 
-	term, err := newTerm(pty, cmd)
+	term, err := newTerm(pty, cmd, options)
 	if err != nil {
 		pty.Close()
 		return "", err
@@ -108,7 +108,7 @@ func (m *Mux) Close(alias string) error {
 // For now we assume an average of five terminals per workspace, which makes this consume 1MiB of RAM.
 const terminalBacklogSize = 256 << 10
 
-func newTerm(pty *os.File, cmd *exec.Cmd) (*Term, error) {
+func newTerm(pty *os.File, cmd *exec.Cmd, options TermOptions) (*Term, error) {
 	token, err := uuid.NewRandom()
 	if err != nil {
 		return nil, err
@@ -119,10 +119,15 @@ func newTerm(pty *os.File, cmd *exec.Cmd) (*Term, error) {
 		return nil, err
 	}
 
+	timeout := options.ReadTimeout
+	if timeout == 0 {
+		timeout = 1<<63 - 1
+	}
 	res := &Term{
 		PTY:     pty,
 		Command: cmd,
 		Stdout: &multiWriter{
+			timeout:  timeout,
 			listener: make(map[*multiWriterListener]struct{}),
 			recorder: recorder,
 		},
@@ -131,6 +136,12 @@ func newTerm(pty *os.File, cmd *exec.Cmd) (*Term, error) {
 	}
 	go io.Copy(res.Stdout, pty)
 	return res, nil
+}
+
+// TermOptions is a pseudo-terminal configuration
+type TermOptions struct {
+	// timeout after which a listener is dropped. Use 0 for no timeout.
+	ReadTimeout time.Duration
 }
 
 // Term is a pseudo-terminal
@@ -145,6 +156,7 @@ type Term struct {
 
 // multiWriter is like io.MultiWriter, except that we can listener at runtime.
 type multiWriter struct {
+	timeout  time.Duration
 	closed   bool
 	mu       sync.RWMutex
 	listener map[*multiWriterListener]struct{}
@@ -152,6 +164,9 @@ type multiWriter struct {
 	// new listener is initialized with the latest recodring first
 	recorder *RingBuffer
 }
+
+// ErrReadTimeout happens when a listener takes too long to read
+var ErrReadTimeout = errors.New("read timeout")
 
 type multiWriterListener struct {
 	io.Reader
@@ -249,14 +264,14 @@ func (mw *multiWriter) Write(p []byte) (n int, err error) {
 
 		select {
 		case lstr.cchan <- p:
-		case <-time.After(5 * time.Second):
-			lstr.Close(errors.New("write timeout"))
+		case <-time.After(mw.timeout):
+			lstr.Close(ErrReadTimeout)
 		}
 
 		select {
 		case <-lstr.done:
-		case <-time.After(5 * time.Second):
-			lstr.Close(errors.New("write timeout"))
+		case <-time.After(mw.timeout):
+			lstr.Close(ErrReadTimeout)
 		}
 	}
 	return len(p), nil
